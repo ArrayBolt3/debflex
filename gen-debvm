@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# gen-debvm - creates Debian and Ubuntu virtual machine images
+# Copyright (c) 2023 Aaron Rainbolt.
+# This program is free software - you may use it under the terms of the GNU
+# General Public License version 2, or (at your option) any later version.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -u;
+set -e;
+
+_mainFn() {
+  declare _distro _code_name _user_name _user_password _root_password \
+    _package_list _image_name _image_size _counter;
+
+  if [ "$#" -lt '6' ]; then
+    echo 'Fatal error - too few arguments. See README.md for usage';
+    echo 'information.';
+  fi
+
+  _distro="$1";
+  _code_name="$2";
+  _user_name="$3";
+  _user_password="$4";
+  _root_password="$5";
+  shift 5;
+
+  _counter="$#";
+  while [ "$_counter" -gt '2' ]; do
+    _package_list["$_counter"]="$1";
+    shift;
+    _counter=$((_counter - 1));
+  done
+
+  _image_name="$1";
+  _image_size="$2";
+
+  echo "Distro: $_distro";
+  echo "Codename: $_code_name";
+  echo "Username: $_user_name";
+  echo "User password: $_user_password";
+  echo "Root password: $_root_password";
+  echo "Package list: ${_package_list[*]}";
+  echo "Image name: $_image_name";
+  echo "Image size: $_image_size";
+  echo;
+  echo 'Does this look correct? Press Ctrl+C to back out if this looks wrong.';
+  echo 'Otherwise, press any key to continue.';
+  echo
+  read -n1 -s;
+  echo 'Preparing to build...';
+
+  modprobe nbd;
+  sleep 2;
+
+  echo "Building...";
+
+  qemu-img create -f raw "$_image_name" "$_image_size";
+  qemu-nbd -d /dev/nbd0;
+  qemu-nbd -f raw -c /dev/nbd0 "$_image_name";
+
+  fdisk /dev/nbd0 << 'ENDPARTITIONING';
+n
+p
+1
+
+
+w
+ENDPARTITIONING
+
+  mkfs.ext4 -L debvm /dev/nbd0p1;
+
+  mkdir vdisk;
+  mount /dev/nbd0p1 ./vdisk;
+  debootstrap "$_code_name" vdisk;
+
+  mount --bind /dev vdisk/dev;
+  mount --bind /dev/pts vdisk/dev/pts;
+  mount --bind /proc vdisk/proc;
+  mount --bind /sys vdisk/sys;
+
+  tee > vdisk/doPrep.sh << 'ENDPREPSCRIPT'
+#!/bin/bash
+# Stage 2 prep script
+set -u;
+set -e;
+
+_mainFn() {
+  declare _distro _code_name _user_name _user_password _root_password \
+    _package_list _counter;
+
+  _distro="$1";
+  _code_name="$2";
+  _user_name="$3";
+  _user_password="$4";
+  _root_password="$5";
+  shift 5;
+
+  _counter="$#";
+  while [ "$_counter" -gt '0' ]; do
+    _package_list["$_counter"]="$1";
+    shift;
+    _counter=$((_counter - 1));
+  done
+
+  # Who needs 80-character line length limits anyway...
+  if [ "$_distro" = 'debian' ]; then
+    echo "deb http://deb.debian.org/debian $_code_name main contrib non-free" > /etc/apt/sources.list;
+  else
+    echo "deb http://archive.ubuntu.com/ubuntu $_code_name main universe restricted multiverse" > /etc/apt/sources.list;
+    echo "deb http://archive.ubuntu.com/ubuntu $_code_name-security main universe restricted multiverse" >> /etc/apt/sources.list;
+    echo "deb http://archive.ubuntu.com/ubuntu $_code_name-updates main universe restricted multiverse" >> /etc/apt/sources.list;
+    echo "deb http://archive.ubuntu.com/ubuntu $_code_name-backports main universe restricted multiverse" >> /etc/apt/sources.list;
+  fi
+
+  apt update;
+  apt full-upgrade;
+
+  if [ "$_distro" = 'debian' ]; then
+    DEBIAN_FRONTEND=noninteractive \
+      apt -y install linux-image-amd64 grub-pc ${_package_list[@]};
+  else
+    DEBIAN_FRONTEND=noninteractive \
+      apt -y install linux-generic grub-pc ${_package_list[@]};
+  fi
+
+  grub-install /dev/nbd0;
+  update-grub;
+
+  adduser --gecos "" --disabled-password "$_user_name";
+  adduser "$_user_name" sudo;
+ 
+  { echo "$_user_password"; echo "$_user_password"; } | passwd "$_user_name";
+  { echo "$_root_password"; echo "$_root_password"; } | passwd root;
+
+  if [ "$_distro" = 'ubuntu' ]; then
+    # From https://askubuntu.com/a/1075112/1598467
+    rm /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf \
+      || true;
+  fi
+
+  echo 'LABEL=debvm / ext4 defaults 0 1' > /etc/fstab;
+}
+
+_mainFn "$@";
+ENDPREPSCRIPT
+  chmod +x vdisk/doPrep.sh;
+
+  # yes, the last argument is left without quote marks, this is on purpose
+  chroot vdisk ./doPrep.sh "$_distro" "$_code_name" "$_user_name" \
+    "$_user_password" "$_root_password" ${_package_list[@]};
+
+  umount vdisk/dev/pts;
+  umount vdisk/dev;
+  umount vdisk/proc;
+  umount vdisk/sys;
+  umount vdisk;
+  qemu-nbd -d /dev/nbd0;
+  rmdir vdisk;
+
+  echo 'Build complete.';
+}
+
+if [ "$UID" != '0' ]; then
+  echo 'This script must be run as root.';
+  exit 1;
+fi
+
+_mainFn "$@";
